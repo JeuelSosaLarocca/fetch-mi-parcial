@@ -43,12 +43,13 @@ test("página no archivada -> NotArchivedError", async () => {
   await assert.rejects(fetchHtml("https://www.altillo.com/examenes/zzz/nada.asp", { fetchImpl }), { name: "NotArchivedError" });
 });
 
-test("resolveAsset: imágenes con im_, PDFs con id_, faltantes -> null", async () => {
+test("resolveAsset: imágenes con im_, PDFs con id_, faltantes -> null (vía CDX, sólo HTTP 200)", async () => {
   const wb = { fuente: "wayback" };
   const fetchImpl = async (u) => {
-    const asset = decodeURIComponent(u.split("url=")[1]);
-    if (asset.includes("falta")) return resp(200, JSON.stringify({ archived_snapshots: {} }));
-    return resp(200, JSON.stringify({ archived_snapshots: { closest: { available: true, status: "200", timestamp: "20250428081331" } } }));
+    assert.match(u, /cdx\/search\/cdx\?.*filter=statuscode:200/);
+    const asset = decodeURIComponent(/url=([^&]+)/.exec(u)[1]);
+    if (asset.includes("falta")) return resp(200, "[]");
+    return resp(200, JSON.stringify([["timestamp"], ["20250428081331"]]));
   };
   const img = "https://www.altillo.com/examenes/x/a.gif";
   const pdf = "https://www.altillo.com/examenes/x/b.pdf";
@@ -56,6 +57,21 @@ test("resolveAsset: imágenes con im_, PDFs con id_, faltantes -> null", async (
   assert.equal(await resolveAsset(pdf, wb, { fetchImpl }), `https://web.archive.org/web/20250428081331id_/${pdf}`);
   assert.equal(await resolveAsset("https://www.altillo.com/examenes/x/falta.gif", wb, { fetchImpl }), null);
   assert.equal(await resolveAsset(img, { fuente: "altillo" }, { fetchImpl }), img);
+});
+
+test("si la captura más reciente es un desafío de Cloudflare, usa la última con contenido real", async () => {
+  const url = "https://www.altillo.com/examenes/test-c/index.asp";
+  const fetchImpl = async (u) => {
+    if (u.startsWith("https://www.altillo.com/")) return resp(403, "<title>Just a moment...</title>");
+    if (u.includes("/cdx/search/")) return resp(200, JSON.stringify([["timestamp"], ["20260519033750"], ["20260730203114"]]));
+    if (u.includes("/29991231000000id_/"))
+      return resp(403, "<title>Just a moment...</title>", { url: `https://web.archive.org/web/20261108174003id_/${url}` });
+    const ts = /web\/(\d{14})id_/.exec(u)[1];
+    return resp(200, `<html><title>real ${ts}</title></html>`, { url: u });
+  };
+  const html = await fetchHtml(url, { fetchImpl });
+  assert.match(html, /real 20260730203114/);
+  assert.equal(getFetchInfo(url).snapshot, "2026-07-30");
 });
 
 test("getExam separa recursos archivados de faltantes", async () => {

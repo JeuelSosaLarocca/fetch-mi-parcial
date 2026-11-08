@@ -73,20 +73,66 @@ async function fetchDirect(url, fetchImpl) {
 /** Timestamp YYYYMMDDhhmmss -> "YYYY-MM-DD". */
 const tsToDate = (ts) => (ts ? `${ts.slice(0, 4)}-${ts.slice(4, 6)}-${ts.slice(6, 8)}` : null);
 
-async function fetchWayback(url, fetchImpl) {
-  await pace("wayback");
-  // Un timestamp en el futuro hace que Wayback redirija a la copia más reciente.
-  // El modificador id_ devuelve el HTML original, sin la barra de Wayback.
-  const res = await fetchImpl(`${WAYBACK}/29991231000000id_/${url}`, { headers, redirect: "follow" });
-  if (res.status === 404) throw new NotArchivedError(url);
-  if (!res.ok) throw new Error(`Wayback respondió HTTP ${res.status} para ${url}`);
-  const html = decode(await res.arrayBuffer(), res.headers.get("content-type") || "");
-  const ts = /\/web\/(\d{14})/.exec(res.url || "")?.[1] ?? null;
-  return { html, info: { fuente: "wayback", url, snapshot: tsToDate(ts), archivoUrl: res.url } };
+/** Timestamps de las últimas capturas con HTTP 200 (más nuevas primero), según el índice CDX. */
+async function cdxTimestamps(url, fetchImpl, limit = 6) {
+  await pace("wayback-cdx");
+  const q = `https://web.archive.org/cdx/search/cdx?url=${encodeURIComponent(url)}&output=json&filter=statuscode:200&fl=timestamp&limit=-${limit}`;
+  const res = await fetchImpl(q, { headers });
+  if (!res.ok) return [];
+  const rows = await res.json().catch(() => []);
+  return rows.slice(1).map((r) => r[0]).reverse();
 }
 
+async function getSnapshot(url, ts, fetchImpl) {
+  await pace("wayback");
+  // El modificador id_ devuelve el contenido original, sin la barra de Wayback.
+  const res = await fetchImpl(`${WAYBACK}/${ts}id_/${url}`, { headers, redirect: "follow" });
+  const html = decode(await res.arrayBuffer(), res.headers.get("content-type") || "");
+  const realTs = /\/web\/(\d{14})/.exec(res.url || "")?.[1] ?? ts;
+  return { res, html, ts: realTs };
+}
+
+async function fetchWayback(url, fetchImpl) {
+  // Camino rápido: un timestamp futuro redirige a la captura más reciente.
+  const latest = await getSnapshot(url, "29991231000000", fetchImpl);
+  if (latest.res.status === 404) throw new NotArchivedError(url);
+  let good = latest.res.ok && !isChallenge(latest.res.status, latest.html) ? latest : null;
+
+  // Si la más reciente es un desafío de Cloudflare (el robot de archive.org también fue
+  // bloqueado), se busca en el índice la última captura con contenido real.
+  if (!good) {
+    for (const ts of await cdxTimestamps(url, fetchImpl)) {
+      if (ts === latest.ts) continue;
+      const snap = await getSnapshot(url, ts, fetchImpl);
+      if (snap.res.ok && !isChallenge(snap.res.status, snap.html)) {
+        good = snap;
+        break;
+      }
+    }
+  }
+  if (!good) throw new NotArchivedError(url);
+  const archivoUrl = `${WAYBACK}/${good.ts}id_/${url}`;
+  return { html: good.html, info: { fuente: "wayback", url, snapshot: tsToDate(good.ts), archivoUrl } };
+}
+
+const NET_CODES = new Set(["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT"]);
+
 /** Devuelve el HTML de `url` (string). La procedencia queda disponible en getFetchInfo(url). */
-export async function fetchHtml(url, { fetchImpl = fetch } = {}) {
+export async function fetchHtml(url, opts = {}) {
+  try {
+    return await fetchHtmlInner(url, opts);
+  } catch (err) {
+    const code = err.cause?.code;
+    if (NET_CODES.has(code)) {
+      const e = new Error(`Sin conexión (${code} al intentar ${err.cause?.hostname ?? "el servidor"}). Revisá la conexión a internet.`);
+      e.name = "NetworkError";
+      throw e;
+    }
+    throw err;
+  }
+}
+
+async function fetchHtmlInner(url, { fetchImpl = fetch } = {}) {
   const hit = cache.get(url);
   if (hit && Date.now() - hit.t < TTL_MS) return hit.html;
 
@@ -98,8 +144,11 @@ export async function fetchHtml(url, { fetchImpl = fetch } = {}) {
     try {
       result = await fetchDirect(url, fetchImpl);
     } catch (err) {
-      if (err.name !== "BlockedError" || SOURCE === "directo") throw err;
-      blockedAt = Date.now();
+      if (SOURCE === "directo") throw err;
+      // Bloqueo de Cloudflare o falla de red (DNS, timeout): se recuerda y se pasa a Wayback.
+      // Un error HTTP común (p. ej. 404) también prueba Wayback, pero no marca a Altillo como caído.
+      const unreachable = err.name === "BlockedError" || err.name === "TypeError" || err.cause?.code;
+      if (unreachable) blockedAt = Date.now();
       result = await fetchWayback(url, fetchImpl);
     }
   }
@@ -118,11 +167,9 @@ export function getFetchInfo(url) {
  */
 export async function resolveAsset(assetUrl, pageInfo, { fetchImpl = fetch } = {}) {
   if (!pageInfo || pageInfo.fuente !== "wayback") return assetUrl;
-  await pace("wayback-api");
-  const res = await fetchImpl(`https://archive.org/wayback/available?url=${encodeURIComponent(assetUrl)}`, { headers });
-  if (!res.ok) return null;
-  const closest = (await res.json())?.archived_snapshots?.closest;
-  if (!closest?.available || String(closest.status) !== "200") return null;
+  // Sólo capturas con HTTP 200: una captura nueva bloqueada por Cloudflare no tapa a las buenas.
+  const [ts] = await cdxTimestamps(assetUrl, fetchImpl, 1);
+  if (!ts) return null;
   const mod = /\.(gif|jpe?g|png|webp|bmp)(\?|$)/i.test(assetUrl) ? "im_" : "id_";
-  return `${WAYBACK}/${closest.timestamp}${mod}/${assetUrl}`;
+  return `${WAYBACK}/${ts}${mod}/${assetUrl}`;
 }

@@ -91,6 +91,9 @@ Qué implica:
   `encontrar_examen` pasa al siguiente candidato (hasta 8) si un examen no tiene nada usable.
 - Las URLs devueltas (`…/web/<fecha>im_/…` o `id_/…`) son el archivo original, sin la barra de
   Wayback.
+- **Save Page Now no sirve para actualizarlo**: Cloudflare también bloquea al robot de archive.org,
+  así que una captura nueva guarda la página "Just a moment…" (en blanco). El servidor ignora esas
+  capturas y usa la última con contenido real (vía el índice CDX, sólo respuestas HTTP 200).
 
 Resultados de una prueba real (noviembre 2026):
 
